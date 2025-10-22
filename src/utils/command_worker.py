@@ -2,89 +2,87 @@ from PyQt6.QtCore import QThread, pyqtSignal
 import subprocess
 from configparser import ConfigParser
 import os
-import signal
+import sys
+import threading
 import select
 
+
 class WorkerThread(QThread):
-    # Signals for communicating with the GUI thread
     output_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(int)  # will emit exit code
+    finished_signal = pyqtSignal()
 
     def __init__(self, command_text: str):
         super().__init__()
         self.command_text = command_text
-        self.process = None
-        self.is_terminated = False
+        self._process = None
+        self._is_killed = False
 
     def run(self):
         try:
-            # --- Load configuration file ---
-            config_path = f"{os.environ.get('HOME', '~')}/.config/peppy/peppy.conf"
-            config = ConfigParser(interpolation=None)
-            config.read(config_path)
+            try:
+                CONFIG_PATH = f"{os.environ.get('HOME', '~')}/.config/peppy/peppy.conf"
+                if not os.path.isfile(CONFIG_PATH):
+                    # Create the directory if it doesn't exist
+                    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+                    # Create the config file with default values
+                    config = ConfigParser(interpolation=None)
+                    config["MISC"] = {'PATHS': ''}
+                    with open(CONFIG_PATH, 'w') as configfile:
+                        config.write(configfile)
 
-            # Retrieve additional PATH entries from config, if any
-            custom_paths = config.get("MISC", "PATHS", fallback="")
+                config = ConfigParser(interpolation=None)
+                config.read(CONFIG_PATH)
+                paths = config["MISC"].get('PATHS', '')
+            except (KeyError, Exception) as e:
+                # Handle potential errors during config file reading
+                paths = ''
+                self.error_signal.emit(f"[CONFIG ERROR] {str(e)}")
 
-            # --- Prepare command ---
-            # Use bash explicitly to support `export`
-            full_command = (
-                f'bash -c "export PATH=\\"$PATH:{custom_paths}\\"; {self.command_text}"'
-            )
+            command = f'export PATH="$PATH:{paths}";{self.command_text}'
+            self._process = subprocess.Popen(command,
+                                             stdout=subprocess.PIPE,
+                                             stderr=subprocess.PIPE,
+                                             shell=True,
+                                             text=True,
+                                             bufsize=1,
+                                             universal_newlines=True
+                                             )
 
-            # --- Start subprocess in a new process group ---
-            self.process = subprocess.Popen(
-                full_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=True,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                preexec_fn=os.setsid,  # ensures we can terminate child processes safely
-            )
-
-            # --- Read process output in real time ---
+            # Use select to read from stdout and stderr in a non-blocking way
             while True:
-                if self.is_terminated:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                if self._is_killed:
+                    self._process.terminate()
                     break
 
-                read_descriptors = [self.process.stdout.fileno(), self.process.stderr.fileno()]
-                ready_descriptors, _, _ = select.select(read_descriptors, [], [])
+                # Check if there's data to read from stdout or stderr
+                rlist, _, _ = select.select([self._process.stdout, self._process.stderr], [], [], 0.1) # 0.1 second timeout
 
-                for descriptor in ready_descriptors:
-                    if descriptor == self.process.stdout.fileno():
-                        line = self.process.stdout.readline()
+                for fd in rlist:
+                    if fd == self._process.stdout:
+                        line = self._process.stdout.readline()
                         if line:
                             self.output_signal.emit(line.rstrip())
-                    elif descriptor == self.process.stderr.fileno():
-                        line = self.process.stderr.readline()
+                    elif fd == self._process.stderr:
+                        line = self._process.stderr.readline()
                         if line:
                             self.error_signal.emit(line.rstrip())
 
-                if self.process.poll() is not None:
+                # If the process has terminated and there's no more output, break the loop
+                if self._process.poll() is not None and not rlist:
                     break
 
-            exit_code = self.process.returncode or 0
-
-        except Exception as exception:
-            self.error_signal.emit(f"[ERROR] {str(exception)}")
-            exit_code = 1
-
+        except Exception as e:
+            self.error_signal.emit(f"[ERROR] {str(e)}")
         finally:
-            # Clean up I/O streams
-            if self.process:
-                if self.process.stdout:
-                    self.process.stdout.close()
-                if self.process.stderr:
-                    self.process.stderr.close()
-
-            self.finished_signal.emit(exit_code)
+            self.finished_signal.emit()
+            if self._process:
+                if self._process.stdout:
+                    self._process.stdout.close()
+                if self._process.stderr:
+                    self._process.stderr.close()
 
     def stop(self):
-        """Request the thread to terminate and kill the process if running."""
-        self.is_terminated = True
-        if self.process and self.process.poll() is None:
-            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+        self._is_killed = True
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
